@@ -48,30 +48,66 @@ function responseToResult(response) {
   return { FAILURE: message };
 }
 
+/** Default cap on simultaneous in-flight requests when fetching many URLs. */
+const DEFAULT_CONCURRENCY = 10;
+
+/**
+ * Runs `mapper` over `items` with at most `concurrency` async operations in flight.
+ * Results are stored by index so output order matches `items` even though work finishes out of order.
+ *
+ * @template T, R
+ * @param {T[]} items
+ * @param {number} concurrency
+ * @param {(item: T, index: number) => Promise<R>} mapper
+ * @returns {Promise<R[]>}
+ */
+async function mapWithConcurrency(items, concurrency, mapper) {
+  const results = new Array(items.length);
+  // Shared cursor: each worker grabs the next index synchronously, then awaits mapper (no race on `next`).
+  let next = 0;
+
+  async function worker() {
+    while (true) {
+      const index = next++;
+      if (index >= items.length) {
+        return;
+      }
+      // Write by `index` so `results` ends up aligned with `items` regardless of completion order.
+      results[index] = await mapper(items[index], index);
+    }
+  }
+
+  // No need to spawn more workers than items or than the concurrency budget.
+  const workerCount = Math.min(concurrency, items.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
+}
+
 /**
  * Executes a HTTP GET request on each of the URLs, transforms each of the HTTP
  * responses according to the challenge instructions and returns the results.
  *
- * Requests run in parallel so total time stays bounded when the mock uses per-request delays.
+ * Uses a bounded worker pool so large URL lists do not open unbounded concurrent connections.
  *
  * @param {string[]} urls The urls to be requested.
+ * @param {number} [concurrency=DEFAULT_CONCURRENCY] Max simultaneous `httpGet` calls.
  * @returns {Promise<Array<{ 'Arnie Quote': string } | { 'FAILURE': string }>>}
  *   A promise which resolves to a results array in the same order as `urls`.
  */
-const getArnieQuotes = async (urls) => {
-  return Promise.all(
-    urls.map(async (url) => {
-      try {
-        const response = await httpGet(url);
-        return responseToResult(response);
-      } catch (error) {
-        console.error(`[getArnieQuotes] error calling httpGet for URL: ${url}`, error);
-        // based on the requirements, it's not 100% clear what to do in this case, 
-        // so we'll return a FAILURE with the error message
-        return { FAILURE: error instanceof Error ? error.message : String(error) };
-      }
-    }),
-  );
+const getArnieQuotes = async (urls, concurrency = DEFAULT_CONCURRENCY) => {
+  const limit = Math.max(1, concurrency);
+
+  return mapWithConcurrency(urls, limit, async (url) => {
+    try {
+      const response = await httpGet(url);
+      return responseToResult(response);
+    } catch (error) {
+      console.error(`[getArnieQuotes] error calling httpGet for URL: ${url}`, error);
+      // based on the requirements, it's not 100% clear what to do in this case,
+      // so we'll return a FAILURE with the error message
+      return { FAILURE: error instanceof Error ? error.message : String(error) };
+    }
+  });
 };
 
 module.exports = {
